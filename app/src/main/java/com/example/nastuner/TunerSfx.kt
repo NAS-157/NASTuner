@@ -14,14 +14,14 @@ import kotlin.math.sin
 
 class TunerSfx(private val context: Context) {
     private val sampleRate = 44100
-    private val crystalBuf: ShortArray by lazy { generateCrystal(sampleRate) }
-    private val beepBuf: ShortArray by lazy { generateBeep(sampleRate) }
+    private val crystalBuf: ShortArray by lazy { generateCrystal(sampleRate) } // Precargado: "cristal" (se genera una vez)
+    private val beepBuf: ShortArray by lazy { generateBeep(sampleRate) } // Precargado: "beep" (se genera una vez)
     @Volatile private var lastPlayAt = 0L
-    private val cooldownMs = 1200L
+    private val cooldownMs = 1200L // Enfriamiento: evita spam del "tin"
 
     fun playInTune(volume: Float, style: SfxStyle) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastPlayAt < cooldownMs) return
+        if (now - lastPlayAt < cooldownMs) return // Si sigue en cooldown, no suena
         lastPlayAt = now
         val buf = when (style) {
             SfxStyle.CRYSTAL -> crystalBuf
@@ -32,9 +32,9 @@ class TunerSfx(private val context: Context) {
 
     private fun playBuffer(data: ShortArray, volume: Float) {
         val track = AudioTrack.Builder()
-            .setAudioAttributes(
+                .setAudioAttributes(
                 AudioAttributes.Builder()
-                    // Use MEDIA to ensure playback routes over the media stream even if system effects are silenced
+                    // MEDIA: respeta volumen multimedia del teléfono (no efectos del sistema)
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                     .build()
@@ -51,17 +51,17 @@ class TunerSfx(private val context: Context) {
             .build()
         track.write(data, 0, data.size)
         try {
-            // setVolume is API 21+, we're minSdk 35
+            // setVolume: API 21+ (minSdk 35)
             track.setVolume(volume)
         } catch (t: Throwable) {
             @Suppress("DEPRECATION")
             track.setStereoVolume(volume, volume)
         }
         track.play()
-        // Schedule release after playback
+        // Soltar el recurso un rato después de reproducir
         Thread {
             try {
-                // Add a small margin to ensure the buffer fully drains before releasing
+                // Margen extra para que el buffer drene antes de liberar
                 Thread.sleep((1000L * data.size / sampleRate) + 80)
             } catch (_: InterruptedException) {}
             try {
@@ -74,7 +74,7 @@ class TunerSfx(private val context: Context) {
     }
 
     private fun generateBeep(sr: Int): ShortArray {
-        val dur = 0.18 // 180 ms
+        val dur = 0.18 // beep corto (~180 ms)
         val n = (dur * sr).toInt()
         val buf = ShortArray(n)
         val f = 1200.0
@@ -90,7 +90,7 @@ class TunerSfx(private val context: Context) {
 
     private fun generateCrystal(sr: Int): ShortArray {
         // A short, bright, glassy chime using a few partials and an initial noise tick
-        val dur = 0.22
+        val dur = 0.22 // chime corto (~220 ms)
         val n = (dur * sr).toInt()
         val buf = DoubleArray(n)
         val base = 1760.0 // A6 base for brightness
@@ -104,11 +104,11 @@ class TunerSfx(private val context: Context) {
                 val env = exp(-t / decays[p])
                 v += sin(2 * PI * f * t) * env * (1.0 / (p + 1))
             }
-            // Tiny noise burst at start to emulate a brittle hit
+            // Estallido de ruido inicial para dar sensación de golpe vítreo
             val noise = if (i < (0.01 * sr)) (Math.random() * 2 - 1) * (1.0 - i / (0.01 * sr)) else 0.0
             buf[i] = (v * 0.35 + noise * 0.08)
         }
-        // Soft clip
+        // Soft clip: comprime picos para evitar distorsión fea
         val out = ShortArray(n)
         for (i in 0 until n) {
             val x = buf[i]
@@ -119,7 +119,7 @@ class TunerSfx(private val context: Context) {
     }
 
     private fun tanhLike(x: Double): Double {
-        // Fast soft clip approximating tanh without heavy math
+        // Soft clip rápido tipo tanh, barato de calcular
         val a = 1.5
         return x * (a + x * x) / (a + 1.0 * x * x)
     }

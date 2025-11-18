@@ -216,11 +216,12 @@ val colorblindRecommendedPalettes = listOf(
     ColorPalette(Color(0xFF37474F), Color(0xFFFFE082))  // Slate / Light Orange
 )
 
-// --- Main Activity ---
+// --- Actividad principal de la app (pantalla y orquestación) ---
 class MainActivity : ComponentActivity() {
     private val audioAnalyzer = AudioAnalyzer()
     private lateinit var tunerSfx: TunerSfx
     private val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+        // Si dan permiso de mic, partimos el analizador en segundo plano (IO)
         if (isGranted) { CoroutineScope(Dispatchers.IO).launch { audioAnalyzer.start() } }
     }
 
@@ -234,7 +235,7 @@ class MainActivity : ComponentActivity() {
             var selectedTuning by remember { mutableStateOf(instrumentTunings[selectedInstrument]!!.first()) }
             var manualStringIndex by remember { mutableStateOf<Int?>(null) }
 
-            // Load persisted preferences once
+            // Cargar ajustes/selecciones guardados (una vez)
             LaunchedEffect(Unit) {
                 val ctx = applicationContext
                 val loaded = AppPreferences.loadSettings(ctx)
@@ -243,31 +244,32 @@ class MainActivity : ComponentActivity() {
                 selectedInstrument = sel.instrument
                 selectedTuning = sel.tuning
                 manualStringIndex = sel.manualIndex
-                // Restore reference A4 immediately
+                // Restaurar referencia A4 al tiro
                 MusicTheory.setReferenceA4(loaded.referenceA4Hz)
-                // Restore ambient baseline if available
+                // Restaurar línea base de ruido ambiente si existe
                 AppPreferences.loadAmbient(ctx)?.let { audioAnalyzer.setAmbientBase(it) }
             }
 
             LaunchedEffect(settings.micSensitivity) {
+                // Pasar sensibilidad de mic al analizador
                 audioAnalyzer.setSensitivity(settings.micSensitivity)
             }
-            // Apply configurable note latch duration to analyzer
+            // Pasar duración de latch (estabilidad) al analizador
             LaunchedEffect(settings.noteLatchMs) {
                 audioAnalyzer.setNoteLatchMs(settings.noteLatchMs)
             }
-            // Update reference A4 for music theory calculations
+            // Actualizar A4 para cálculos de notas
             LaunchedEffect(settings.referenceA4Hz) {
                 MusicTheory.setReferenceA4(settings.referenceA4Hz)
             }
-            // Persist settings on change
+            // Guardar ajustes cada vez que cambian
             LaunchedEffect(settings) {
                 AppPreferences.saveSettings(applicationContext, settings)
             }
 
             NASTunerTheme {
                 val tuningData by audioAnalyzer.tuningState.collectAsState()
-                // Always honor the selected palette; when colorblind mode is ON we still allow choosing from a colorblind-safe list in the Color tab
+                // Usar siempre la paleta seleccionada; en modo daltónico sugerimos paletas seguras
                 val finalPalette = settings.palette
                 Surface(modifier = Modifier.fillMaxSize(), color = finalPalette.background) {
                     TunerScreen(
@@ -277,7 +279,7 @@ class MainActivity : ComponentActivity() {
                         palette = finalPalette,
                         setAnalyzerBounds = { minHz, maxHz -> audioAnalyzer.setFrequencyBounds(minHz, maxHz) },
                         setExpectedFrequency = { f -> audioAnalyzer.setExpectedFrequency(f) },
-                        calibrateAmbient = { durationMs -> audioAnalyzer.calibrateAmbient(durationMs) },
+                        calibrateAmbient = { durationMs -> audioAnalyzer.calibrateAmbient(durationMs) }, // Calibración de ruido ambiente
                         onAmbientCalibrated = { value ->
                             CoroutineScope(Dispatchers.IO).launch {
                                 AppPreferences.saveAmbient(applicationContext, value)
@@ -285,11 +287,13 @@ class MainActivity : ComponentActivity() {
                         },
                         calibrateA4 = { durationMs -> audioAnalyzer.autoCalibrateA4(durationMs) },
                         onStrictInTune = {
+                            // Suena al primer cruce a "estrictamente afinado" (rising edge)
                             if (settings.enableTuneSound) {
                                 tunerSfx.playInTune(settings.soundVolume, settings.soundStyle)
                             }
                         },
                         onTestTuneSound = {
+                            // Botón de prueba (Ajustes > Sonido)
                             tunerSfx.playInTune(settings.soundVolume, settings.soundStyle)
                         },
                         selectedInstrument = selectedInstrument,
@@ -583,13 +587,13 @@ fun TunerScreen(
         }
     }
 
-    // Hook analyzer with instrument bounds and expected frequency for manual string
+    // Enganchar analizador con rangos del instrumento; usar frecuencia esperada si hay cuerda manual
     LaunchedEffect(selectedInstrument) {
         instrumentFrequencyRanges[selectedInstrument]?.let { (minHz, maxHz) ->
             setAnalyzerBounds(minHz, maxHz)
         }
     }
-    // Update expected frequency for analyzer: manual selection wins; else improved auto-latch when stable
+    // Actualizar frecuencia esperada: manda manual; si no, auto‑latch mejorado cuando está estable
     LaunchedEffect(manualStringIndex, selectedInstrument, selectedTuning, tuningData.frequency) {
         val bounds = instrumentFrequencyRanges[selectedInstrument]
         if (manualStringIndex != null && bounds != null) {
@@ -601,7 +605,7 @@ fun TunerScreen(
                 setExpectedFrequency(null)
             }
         } else {
-            // Auto latch logic
+            // Auto‑latch: elige cuerda probable por cents + penaliza saltos de octava + premio continuidad
             if (bounds != null && tuningData.frequency > 0) {
                 val fDet = tuningData.frequency
                 val baseFs = selectedTuning.notes.map { n -> MusicTheory.nearestFrequencyForNoteInRange(n, bounds.first, bounds.second) }
@@ -629,7 +633,7 @@ fun TunerScreen(
                     if (autoLatchedIndex == null && autoLatchScore >= autoLatchThreshold) {
                         autoLatchedIndex = bestIdx
                     }
-                    // Provide expected freq when latched
+                    // Al latchear, fijar expectedFreq de esa cuerda
                     val activeIdx = autoLatchedIndex
                     if (activeIdx != null) {
                         val noteName = selectedTuning.notes[activeIdx]
@@ -639,7 +643,7 @@ fun TunerScreen(
                         setExpectedFrequency(null)
                     }
                 }
-                // Reset latch on silence
+                // En silencio, reiniciar latch
                 if (tuningData.frequency <= 0) {
                     autoLatchedIndex = null
                     autoLatchScore = 0
@@ -1149,7 +1153,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     val indicatorColor = accentColor.copy(alpha = 0.95f)
     val indicatorHeight = 250.dp
 
-    // Two-tier thresholds: visual (permissive) vs strict (practical)
+    // Dos niveles de umbral: visual (más permisivo) vs estricto (práctico)
     val baseThreshold = if (settings.adaptiveThreshold) {
         when {
             tuningData.frequency < 80 -> 2.5
@@ -1191,7 +1195,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     )
     val animatedStrokeWidth by animateFloatAsState(targetValue = if (isInTuneVisual) 8f else 5f, label = "strokeAnimation")
 
-    // Deviation unit selection (Hz or cents)
+    // Selección de unidad de desviación (Hz o cents)
     val unitIsHz = settings.guideUnit == GuideUnit.HZ
     val minor = settings.visualRange.minor
     val major = settings.visualRange.major
@@ -1199,7 +1203,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     val deviationUnits = if (unitIsHz) deviationInHz else {
         if (tuningData.frequency > 0 && targetHz > 0.0) 1200.0 * log2(tuningData.frequency / targetHz) else 0.0
     }
-    // Visual smoothing and deadband to reduce jitter (more conservative)
+    // Suavizado visual y zona muerta para reducir jitter (más conservador)
     val deadbandUnits = if (unitIsHz) 0.2 else 4.0
     var visualUnits by remember { mutableStateOf(0.0) }
     LaunchedEffect(deviationUnits) {
@@ -1208,7 +1212,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     }
     val displayUnits = if (kotlin.math.abs(visualUnits) < deadbandUnits) 0.0 else visualUnits
     val normalizedOffset = (displayUnits / major).coerceIn(-1.0, 1.0).toFloat()
-    // Additional rate limiting to cap movement speed per frame
+    // Límite adicional de velocidad para acotar el movimiento por cuadro
     var smoothedOffset by remember { mutableStateOf(0f) }
     LaunchedEffect(normalizedOffset) {
         // Slightly higher damping at low confidence (more smoothing), more agile when confident
@@ -1222,10 +1226,10 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
         label = "offsetAnimation"
     )
 
-    // Compute a guide color that contrasts with the background
+    // Calcular un color guía que contraste con el fondo
     val bgLum = backgroundColor.luminance()
     val guideBase = if (bgLum < 0.5f) Color.White else Color.Black
-    // Adaptive alpha: very dark/very light backgrounds -> medium alpha; mid backgrounds -> higher alpha
+    // Alfa adaptativo: fondos muy oscuros/muy claros -> alfa medio; fondos intermedios -> alfa mayor
     val guideAlpha = when {
         bgLum < 0.1f -> 0.6f
         bgLum < 0.3f -> 0.8f
@@ -1253,25 +1257,25 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
             val circleOffsetY = centerY - (animatedOffset * centerY)
             val circleCenter = Offset(x = circleCenterX, y = circleOffsetY)
 
-            // Main line (precision)
+            // Línea principal (precisión)
             val mainLineColor = indicatorColor
             drawLine(color = mainLineColor, start = Offset(x = 0f, y = centerY), end = Offset(x = size.width, y = centerY), strokeWidth = animatedStrokeWidth)
 
-            // Extra glow when visually in tune; stronger if strictly in tune
+            // Halo extra cuando está visualmente afinado; más fuerte si está estrictamente afinado
             if (isInTuneVisual) {
                 val haloAlpha = if (isInTuneStrict) (0.24f + 0.25f * baseConfidence) else (0.15f + 0.2f * baseConfidence)
                 drawLine(color = accentColor.copy(alpha = haloAlpha), start = Offset(x = 0f, y = centerY - 6f), end = Offset(x = size.width, y = centerY - 6f), strokeWidth = 6f)
                 drawLine(color = accentColor.copy(alpha = haloAlpha), start = Offset(x = 0f, y = centerY + 6f), end = Offset(x = size.width, y = centerY + 6f), strokeWidth = 6f)
             }
 
-            // Guide lines shorter on the left
+            // Líneas guía más cortas a la izquierda
             mainGuides.forEach { g ->
                 val pos = (g / major).toFloat()
                 val y = centerY - (centerY * pos)
                 val leftShort = size.width * 0.12f
                 drawLine(color = guideColor, start = Offset(x = leftShort, y = y), end = Offset(x = size.width, y = y), strokeWidth = if (abs(g) == major) 2f else 1.4f)
             }
-            // Fine guides
+            // Guías finas
             fineGuides.forEach { g ->
                 val pos = (g / major).toFloat()
                 val y = centerY - (centerY * pos)
@@ -1282,7 +1286,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
                 drawLine(color = guideColor.copy(alpha = 0.6f), start = Offset(x = leftShort, y = y2), end = Offset(x = size.width, y = y2), strokeWidth = 0.8f)
             }
 
-            // Glow and Circle
+            // Halo y círculo
             if (animatedGlow > 0) {
                 drawCircle(
                     brush = Brush.radialGradient(colors = listOf(accentColor.copy(alpha = 0.55f * animatedGlow), Color.Transparent), center = circleCenter, radius = animatedRadius * 3.2f * animatedGlow),
@@ -1293,7 +1297,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
             drawCircle(color = accentColor, radius = animatedRadius, center = circleCenter)
         }
 
-        // Draw labels as composables aligned to left
+        // Dibujar etiquetas como composables alineadas a la izquierda
         mainGuides.forEach { g ->
             val pos = (g / major).toFloat()
             val yDp = centerYDp - (centerYDp * pos)
@@ -1306,7 +1310,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
         }
     }
 
-    // Directional hint (subtle): shows "⬆ Alto" when sharp, "⬇ Bajo" when flat with blinking alpha based on deviation magnitude
+    // Pista direccional (sutil): muestra "⬆ Alto" cuando está agudo, "⬇ Bajo" cuando está grave, con alfa según magnitud de desviación
     val hintAlpha = ((kotlin.math.abs(displayUnits) / major).coerceIn(0.0, 1.0) * (0.2 + 0.6 * baseConfidence)).toFloat()
     val hintText = when {
         displayUnits > 0.25 * minor -> "Alto"

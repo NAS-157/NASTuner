@@ -13,10 +13,10 @@ import kotlinx.coroutines.withContext
 import org.jtransforms.fft.DoubleFFT_1D
 import com.example.nastuner.Instrument
 
-private const val NOTE_LATCH_THRESHOLD = 3 // Requires 3 consistent frames to change note
+private const val NOTE_LATCH_THRESHOLD = 3 // 3 frames seguidos para cambiar nota (evita parpadeos)
 private const val MIN_FREQUENCY_HZ = 40
-@Volatile private var NOTE_LATCH_MS = 2000L // Require ~2s stable before changing note label
-private const val IN_TUNE_HOLD_MS = 1500L // Hold centered when recently in-tune and signal decays
+@Volatile private var NOTE_LATCH_MS = 2000L // ≈2s estable antes de cambiar etiqueta (se siente sólido)
+private const val IN_TUNE_HOLD_MS = 1500L // Mantener cerca de 0 si te centraste y luego la señal se apaga
 
 class AudioAnalyzer {
     private val sampleRate = 44100
@@ -36,7 +36,7 @@ class AudioAnalyzer {
         DoubleArray(bufferSize) { n -> 0.5 - 0.5 * kotlin.math.cos(2.0 * Math.PI * n / (bufferSize - 1)) }
     }
 
-    // Stability variables
+    // Estado para estabilidad (evita saltos y parpadeos)
     private var lastNote: String? = null
     private var noteLatchCounter = 0
     private var smoothedDeviation: Double = 0.0
@@ -44,10 +44,10 @@ class AudioAnalyzer {
     private var committedNote: String? = null
     private var candidateNote: String? = null
     private var candidateSinceMs: Long = 0L
-    // Simple signal activity gating
+    // Puerta de ruido: si hay poca energía, lo tratamos como silencio
     @Volatile private var lastRms: Double = 0.0
     private var lastStableAtMs: Long = 0L
-    // Ambient calibration
+    // Calibración de ambiente: aprende el ruido base sin tocar
     @Volatile private var ambientRmsBase: Double = 0.008
     @Volatile private var calibrateUntilMs: Long = 0L
     private val rmsSamples: MutableList<Double> = mutableListOf()
@@ -121,7 +121,7 @@ class AudioAnalyzer {
         while (isRecording) {
             val readSize = audioRecord?.read(shortBuffer, 0, bufferSize) ?: 0
             if (readSize > 0) {
-                // Copy and window the signal, remove DC offset
+                // Copiar señal, quitar DC y aplicar ventana Hann (suaviza bordes)
                 var mean = 0.0
                 for (i in 0 until readSize) { mean += shortBuffer[i] }
                 mean /= readSize.coerceAtLeast(1)
@@ -131,15 +131,15 @@ class AudioAnalyzer {
                     sumSquares += (v * v)
                     fftBuffer[i] = v * hannWindow[i]
                 }
-                // RMS-based silence detection (normalized to 16-bit range)
+                // Silencio por RMS (normalizado a 16‑bit)
                 val rms = kotlin.math.sqrt(sumSquares / readSize.coerceAtLeast(1)) / 32768.0
                 lastRms = rms
                 val nowTs = SystemClock.elapsedRealtime()
-                // Collect RMS samples during calibration window
+                // Recolectar RMS durante la ventana de calibración
                 if (nowTs <= calibrateUntilMs) {
                     if (rms.isFinite()) rmsSamples.add(rms)
                     if (nowTs + 5 >= calibrateUntilMs) {
-                        // finalize calibration
+                        // Finalizar calibración (mediana robusta)
                         if (rmsSamples.isNotEmpty()) {
                             val sorted = rmsSamples.sorted()
                             val median = sorted[sorted.size / 2]
@@ -149,17 +149,16 @@ class AudioAnalyzer {
                         rmsSamples.clear()
                     }
                 }
-
-                // Silence gate with ambient base and user sensitivity
+                // Puerta de ruido = max(ambiente*1.6, base según sensibilidad)
                 val baseGate = 0.008 + (0.012 * (1.0 - sensitivity.coerceIn(0f, 1f)))
                 val silenceThreshold = max(ambientRmsBase * 1.6, baseGate) // ambient-calibrated gate
                 if (rms < silenceThreshold) {
-                    // Treat as silence: keep last committed note (if any), zero frequency and deviation
+                    // Silencio: conservar última nota mostrada; freq/desviación en 0
                     val frozen = committedNote ?: "..."
                     tuningState.value = TuningData(note = frozen, deviationInHz = 0.0, frequency = 0.0)
                     continue
                 }
-                // Zero pad if readSize < bufferSize
+                // Rellenar con ceros si readSize < bufferSize
                 for (i in readSize until bufferSize) { fftBuffer[i] = 0.0 }
 
                 fft.realForward(fftBuffer)
@@ -181,7 +180,7 @@ class AudioAnalyzer {
                     if (newNote != candidateNote) {
                         candidateNote = newNote
                         candidateSinceMs = now
-                        // don't reset smoothed deviation hard; let it converge
+                        // No resetear duro el suavizado; que converja piola
                     }
 
                     val stable = (now - candidateSinceMs) >= NOTE_LATCH_MS
@@ -190,13 +189,12 @@ class AudioAnalyzer {
                         committedNote = newNote
                     }
 
-                    // IMPORTANT: For tuning guidance, always base deviation on the CURRENTLY detected note,
-                    // not the latched display label. This makes the in-tune indicator responsive immediately
-                    // when you hit the right pitch (even before the label latches).
+                    // Tip clave: calcular desviación según la nota detectada actual (no la etiqueta latcheada)
+                    // para que la UI reaccione al tiro al tono correcto.
                     val deviationToDetected = detected.deviationInHz
 
-                    // If recently in-tune and the signal is decaying (low RMS), hold near zero to avoid drift while the string fades
-                    // Use a STRICTER practical threshold here than the UI uses (UI is more permissive)
+                    // Si te centraste y el RMS cae, mantener cerca de 0 un rato para que no se desvíe al apagarse la cuerda.
+                    // Umbral práctico aquí es más estricto que el de la UI (que es más amable).
                     val inTuneThreshold = when {
                         fundamentalFrequency < 80 -> 1.8
                         fundamentalFrequency <= 500 -> 1.0
@@ -212,12 +210,12 @@ class AudioAnalyzer {
                     val holdActive = decaying && (now - lastStableAtMs) <= IN_TUNE_HOLD_MS
                     val targetDeviation = if (holdActive) 0.0 else deviationToDetected
 
-                    // Exponential Moving Average for smoothing on the shown deviation
+                    // EMA: suaviza la desviación para que no "titee"
                     val alpha = if (holdActive) 0.12 else smoothingFactor
                     smoothedDeviation = (targetDeviation * alpha) + (smoothedDeviation * (1 - alpha))
 
                     if (abs(smoothedDeviation) < 50) { // Update only if deviation is reasonable (in Hz)
-                        // Confidence combines SNR, proximity to target and stability
+                        // Confianza = SNR + cercanía + estabilidad (escala 0..1)
                         val snr = ffResult.snr
                         val snrScore = ((snr - 1.0) / 6.0).coerceIn(0.0, 1.0) // ~1..7 mapped to 0..1
                         val proximityScore = kotlin.math.exp(-kotlin.math.abs(deviationToDetected) / 6.0).coerceIn(0.0, 1.0)
@@ -231,7 +229,7 @@ class AudioAnalyzer {
                         )
                     }
                 } else {
-                    // No fundamental found: freeze to committed note if any
+                    // Sin fundamental: congelar en la nota fijada si existe
                     val frozen = committedNote ?: "..."
                     tuningState.value = TuningData(note = frozen, deviationInHz = 0.0, frequency = 0.0, confidence = 0.0)
                 }
@@ -242,7 +240,7 @@ class AudioAnalyzer {
     private data class FreqStats(val frequency: Double, val snr: Double)
     private fun findFundamentalFrequencyWithStats(spectrum: DoubleArray): FreqStats {
         val hps = spectrum.clone()
-        // Harmonic Product Spectrum
+        // HPS (Espectro de Producto Armónico): resalta la fundamental multiplicando armónicos
         for (h in 2..6) {
             val limit = spectrum.size / h
             for (i in 0 until limit) {
@@ -261,7 +259,7 @@ class AudioAnalyzer {
             maxIndex = min(maxIndex, (high * bufferSize / sampleRate).toInt())
         }
 
-        // Smooth HPS to reduce spurious peaks (lighter moving average to preserve peaks)
+        // Suavizar HPS: promedio corto para bajar picos falsos sin matar el peak
         val smoothed = DoubleArray(hps.size)
         for (i in 0 until hps.size) {
             var sum = 0.0
@@ -273,8 +271,7 @@ class AudioAnalyzer {
             smoothed[i] = if (cnt > 0) sum / cnt else hps[i]
         }
 
-        // Adaptive threshold based on local noise floor and user sensitivity
-        // Estimate noise floor using median for robustness
+        // Umbral adaptativo según ruido local + sensibilidad; piso de ruido por mediana (robusto)
         val bandEnd = minIndex + 200.coerceAtMost(maxIndex - minIndex)
         val band = if (bandEnd > minIndex) smoothed.copyOfRange(minIndex, bandEnd).sorted() else emptyList<Double>()
     val noiseFloor = if (band.isNotEmpty()) band[band.size / 2] else 0.0
@@ -292,13 +289,13 @@ class AudioAnalyzer {
         }
 
     if (fundamentalIndex <= minIndex) return FreqStats(0.0, 0.0)
-    // Additional SNR check: accept if peak is sufficiently above noise
+    // SNR extra: si el pico no sobresale, descartamos
     val snrThreshold = if (expectedFrequency != null) 1.1 else 1.3
     val snrVal = if (noiseFloor > 0) (maxAmplitude / noiseFloor) else 0.0
     val snrOk = if (noiseFloor > 0) snrVal >= snrThreshold else maxAmplitude > 0
     if (maxAmplitude <= adaptiveThreshold && !snrOk) return FreqStats(0.0, snrVal)
 
-        // Parabolic (quadratic) interpolation around the peak for better precision
+        // Interpolación parabólica alrededor del pico (mejor precisión sub-bin)
         val i = fundamentalIndex
     val a = kotlin.math.ln(smoothed[i - 1].coerceAtLeast(1e-12))
     val b = kotlin.math.ln(smoothed[i].coerceAtLeast(1e-12))
@@ -309,7 +306,7 @@ class AudioAnalyzer {
 
         var freq = peakIndex * sampleRate / bufferSize
         expectedFrequency?.let { exp ->
-            // Fold by octaves to be closest to expected
+            // Ajustar por octavas a la opción más plausible según esperado
             while (freq > 0 && freq > exp * 1.6) freq /= 2.0
             while (freq > 0 && freq < exp * 0.62) freq *= 2.0
         }
