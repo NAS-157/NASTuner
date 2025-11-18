@@ -1,0 +1,43 @@
+# Android/Gradle
+.gradle/
+build/
+*/build/
+local.properties
+.idea/
+.vscode/
+.DS_Store
+
+# Keystores and signing
+keystore/
+keystore.properties
+*.jks
+*.keystore
+
+# Generated
+app/build/
+app/**/generated/
+app/**/intermediates/
+app/**/outputs/
+app/**/tmp/
+
+# Logs
+*.log
+
+# OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties

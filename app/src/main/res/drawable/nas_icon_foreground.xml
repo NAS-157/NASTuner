@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<scale xmlns:android="http://schemas.android.com/apk/res/android"
+    android:scaleWidth="0.90"
+    android:scaleHeight="0.90"
+    android:gravity="center">
+    <bitmap
+        android:src="@drawable/nas_logo"
+        android:antialias="true"
+        android:filter="true"
+        android:gravity="center" />
+</scale>
