@@ -1,4 +1,7 @@
 # Android/Gradle
+.tuner-tools/
+.tuner-*.py
+*.apk
 .gradle/
 build/
 */build/

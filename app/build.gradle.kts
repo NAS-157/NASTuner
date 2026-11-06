@@ -94,7 +94,6 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
-    implementation("com.github.wendykierp:JTransforms:3.1")
     // Persistence
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 

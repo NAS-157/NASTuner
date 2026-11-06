@@ -23,7 +23,6 @@ object AppPreferences {
     private val KEY_SENS = floatPreferencesKey("mic_sensitivity")
     private val KEY_COLORBLIND = booleanPreferencesKey("colorblind")
     private val KEY_PRECISION = stringPreferencesKey("precision_mode")
-    private val KEY_ADAPTIVE = booleanPreferencesKey("adaptive_threshold")
     private val KEY_GUIDE_UNIT = stringPreferencesKey("guide_unit")
     private val KEY_VR_MINOR = doublePreferencesKey("visual_range_minor")
     private val KEY_VR_MAJOR = doublePreferencesKey("visual_range_major")
@@ -55,13 +54,12 @@ object AppPreferences {
             micSensitivity = prefs[KEY_SENS] ?: AppSettings().micSensitivity,
             isColorblindMode = prefs[KEY_COLORBLIND] ?: AppSettings().isColorblindMode,
             precisionMode = prefs[KEY_PRECISION]?.let { PrecisionMode.valueOf(it) } ?: AppSettings().precisionMode,
-            adaptiveThreshold = prefs[KEY_ADAPTIVE] ?: AppSettings().adaptiveThreshold,
             guideUnit = prefs[KEY_GUIDE_UNIT]?.let { GuideUnit.valueOf(it) } ?: AppSettings().guideUnit,
             visualRange = VisualRange(
                 prefs[KEY_VR_MINOR] ?: AppSettings().visualRange.minor,
                 prefs[KEY_VR_MAJOR] ?: AppSettings().visualRange.major
             ),
-            noteLatchMs = prefs[KEY_LATCH_MS] ?: AppSettings().noteLatchMs,
+            noteLatchMs = prefs[KEY_LATCH_MS]?.coerceAtMost(250L) ?: AppSettings().noteLatchMs,
             textOutline = prefs[KEY_TEXT_OUTLINE]?.let { OutlineStyle.valueOf(it) } ?: AppSettings().textOutline,
             referenceA4Hz = prefs[KEY_REF_A4] ?: AppSettings().referenceA4Hz,
             enableTuneSound = prefs[KEY_SFX_ENABLE] ?: AppSettings().enableTuneSound,
@@ -78,7 +76,6 @@ object AppPreferences {
             prefs[KEY_SENS] = settings.micSensitivity
             prefs[KEY_COLORBLIND] = settings.isColorblindMode
             prefs[KEY_PRECISION] = settings.precisionMode.name
-            prefs[KEY_ADAPTIVE] = settings.adaptiveThreshold
             prefs[KEY_GUIDE_UNIT] = settings.guideUnit.name
             prefs[KEY_VR_MINOR] = settings.visualRange.minor
             prefs[KEY_VR_MAJOR] = settings.visualRange.major
@@ -96,7 +93,7 @@ object AppPreferences {
         val instrument = prefs[KEY_SEL_INSTRUMENT]?.let { Instrument.valueOf(it) } ?: Instrument.GUITAR
         val tuningName = prefs[KEY_SEL_TUNING]
         val tuning = instrumentTunings[instrument]?.firstOrNull { it.name == tuningName } ?: instrumentTunings[instrument]!!.first()
-        val manualIndex = prefs[KEY_SEL_MANUAL_IDX]
+        val manualIndex = prefs[KEY_SEL_MANUAL_IDX]?.takeIf { it in tuning.notes.indices }
         return Selection(instrument, tuning, manualIndex)
     }
 

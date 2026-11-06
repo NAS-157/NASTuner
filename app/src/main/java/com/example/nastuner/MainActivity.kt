@@ -1,12 +1,13 @@
 package com.example.nastuner
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.os.Bundle
+import android.media.AudioManager
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.flow.collectLatest
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -60,8 +61,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.jtransforms.fft.DoubleFFT_1D
 import kotlin.math.abs
 import kotlin.math.log2
 import kotlin.math.pow
@@ -70,11 +69,6 @@ import kotlin.math.sqrt
 import kotlin.math.floor
 
 // --- Constants ---
-private const val A4_FREQUENCY = 440.0
-private const val A4_INDEX = 57
-private const val NOTE_LATCH_THRESHOLD = 3
-// Visual window for the indicator (smaller = looks more precise)
-private const val MAX_DEVIATION_HZ = 4.0
 
 // --- Data Models ---
 enum class Instrument(val icon: ImageVector, val instrumentName: String) {
@@ -84,12 +78,12 @@ enum class NotationSystem { SCIENTIFIC, SOLFEGE }
 enum class GuideUnit { HZ, CENTS }
 data class VisualRange(val minor: Double, val major: Double)
 enum class PrecisionMode(val threshold: Double, val displayName: String) {
-    BEGINNER(2.0, "Beginner"),
-    STANDARD(1.0, "Standard"),
-    PRO(0.5, "Pro")
+    BEGINNER(5.0, "Inicial (±5 cents)"),
+    STANDARD(3.0, "Estándar (±3 cents)"),
+    PRO(1.0, "Pro (±1 cent)")
 }
 data class ColorPalette(val background: Color, val accent: Color)
-data class Tuning(val name: String, val notes: List<String>)
+
 enum class OutlineStyle { NONE, LIGHT, DARK }
 enum class SfxStyle { CRYSTAL, BEEP }
 data class AppSettings(
@@ -98,10 +92,9 @@ data class AppSettings(
     var micSensitivity: Float = 0.5f,
     var isColorblindMode: Boolean = false,
     var precisionMode: PrecisionMode = PrecisionMode.STANDARD,
-    var adaptiveThreshold: Boolean = true,
-    var guideUnit: GuideUnit = GuideUnit.HZ,
-    var visualRange: VisualRange = VisualRange(2.0, 4.0),
-    var noteLatchMs: Long = 2000L,
+    var guideUnit: GuideUnit = GuideUnit.CENTS,
+    var visualRange: VisualRange = VisualRange(10.0, 20.0),
+    var noteLatchMs: Long = 120L,
     var textOutline: OutlineStyle = OutlineStyle.NONE,
     var referenceA4Hz: Double = 440.0,
     // SFX settings
@@ -109,56 +102,49 @@ data class AppSettings(
     var soundVolume: Float = 0.8f,
     var soundStyle: SfxStyle = SfxStyle.CRYSTAL
 )
-data class TuningData(
-    val note: String = "...",
-    val deviationInHz: Double = 0.0,
-    val frequency: Double = 0.0,
-    val confidence: Double = 0.0
-)
-
 // Typical frequency ranges per instrument (Hz)
 val instrumentFrequencyRanges: Map<Instrument, Pair<Double, Double>> = mapOf(
-    Instrument.GUITAR to (70.0 to 1320.0),   // Allow a bit below E2 for robustness
-    Instrument.BASS to (28.0 to 392.0),      // Allow a bit below B0/E1
-    Instrument.UKULELE to (230.0 to 520.0)   // Slightly wider for low/high variance
+    Instrument.GUITAR to (55.0 to 1400.0),  // Includes Drop C with room to tune from below.
+    Instrument.BASS to (25.0 to 400.0),     // Includes B0 and detuned low strings.
+    Instrument.UKULELE to (130.0 to 600.0)  // Includes baritone and Low G.
 )
 
 val instrumentTunings = mapOf(
     Instrument.GUITAR to listOf(
-        Tuning("Estándar", listOf("E", "A", "D", "G", "B", "E")),
-        Tuning("Drop D", listOf("D", "A", "D", "G", "B", "E")),
-        Tuning("Drop C#", listOf("C#", "G#", "C#", "F#", "A#", "D#")),
-        Tuning("Drop C", listOf("C", "G", "C", "F", "A", "D")),
-        Tuning("Open G", listOf("D", "G", "D", "G", "B", "D")),
-        Tuning("Open D", listOf("D", "A", "D", "F#", "A", "D")),
-        Tuning("Open E", listOf("E", "B", "E", "G#", "B", "E")),
-        Tuning("Open A", listOf("E", "A", "C#", "E", "A", "E")),
-        Tuning("DADGAD", listOf("D", "A", "D", "G", "A", "D")),
-        Tuning("D Standard", listOf("D", "G", "C", "F", "A", "D"))
+        Tuning("Estándar", listOf("E", "A", "D", "G", "B", "E"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("Drop D", listOf("D", "A", "D", "G", "B", "E"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("Drop C#", listOf("C#", "G#", "C#", "F#", "A#", "D#"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("Drop C", listOf("C", "G", "C", "F", "A", "D"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("Open G", listOf("D", "G", "D", "G", "B", "D"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("Open D", listOf("D", "A", "D", "F#", "A", "D"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("Open E", listOf("E", "B", "E", "G#", "B", "E"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("Open A", listOf("E", "A", "C#", "E", "A", "E"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("DADGAD", listOf("D", "A", "D", "G", "A", "D"), listOf(2, 2, 3, 3, 3, 4)),
+        Tuning("D Standard", listOf("D", "G", "C", "F", "A", "D"), listOf(2, 2, 3, 3, 3, 4))
     ),
     Instrument.BASS to listOf(
-        Tuning("Estándar (4)", listOf("E", "A", "D", "G")),
-        Tuning("Drop D (4)", listOf("D", "A", "D", "G")),
-        Tuning("D Standard (4)", listOf("D", "G", "C", "F")),
-        Tuning("Estándar (5)", listOf("B", "E", "A", "D", "G")),
-        Tuning("Tenor (5)", listOf("E", "A", "D", "G", "C")),
-        Tuning("Estándar (6)", listOf("B", "E", "A", "D", "G", "C")),
-        Tuning("Drop C (4)", listOf("C", "G", "C", "F")),
-        Tuning("BEAD (4)", listOf("B", "E", "A", "D")),
-        Tuning("Half-Step Down (4)", listOf("D#", "G#", "C#", "F#")),
-        Tuning("Full-Step Down (4)", listOf("D", "G", "C", "F"))
+        Tuning("Estándar (4)", listOf("E", "A", "D", "G"), listOf(1, 1, 2, 2)),
+        Tuning("Drop D (4)", listOf("D", "A", "D", "G"), listOf(1, 1, 2, 2)),
+        Tuning("D Standard (4)", listOf("D", "G", "C", "F"), listOf(1, 1, 2, 2)),
+        Tuning("Estándar (5)", listOf("B", "E", "A", "D", "G"), listOf(0, 1, 1, 2, 2)),
+        Tuning("Tenor (5)", listOf("E", "A", "D", "G", "C"), listOf(1, 1, 2, 2, 3)),
+        Tuning("Estándar (6)", listOf("B", "E", "A", "D", "G", "C"), listOf(0, 1, 1, 2, 2, 3)),
+        Tuning("Drop C (4)", listOf("C", "G", "C", "F"), listOf(1, 1, 1, 2)),
+        Tuning("BEAD (4)", listOf("B", "E", "A", "D"), listOf(0, 1, 1, 2)),
+        Tuning("Half-Step Down (4)", listOf("D#", "G#", "C#", "F#"), listOf(1, 1, 2, 2)),
+        Tuning("Full-Step Down (4)", listOf("D", "G", "C", "F"), listOf(1, 1, 2, 2))
     ),
     Instrument.UKULELE to listOf(
-        Tuning("Standard (GCEA)", listOf("G", "C", "E", "A")),
-        Tuning("D-Tuning (ADF#B)", listOf("A", "D", "F#", "B")),
-        Tuning("Baritone (DGBE)", listOf("D", "G", "B", "E")),
-        Tuning("Low G", listOf("G", "C", "E", "A")),
-        Tuning("Slack-Key (GCEG)", listOf("G", "C", "E", "G")),
-        Tuning("G-Major", listOf("D", "G", "B", "E")),
-        Tuning("Half-Step Up", listOf("G#", "C#", "F", "A#")),
-        Tuning("Full-Step Up", listOf("A", "D", "F#", "B")),
-        Tuning("Open C", listOf("G", "C", "E", "C")),
-        Tuning("Slide", listOf("A", "C#", "E", "A"))
+        Tuning("Standard (GCEA)", listOf("G", "C", "E", "A"), listOf(4, 4, 4, 4)),
+        Tuning("D-Tuning (ADF#B)", listOf("A", "D", "F#", "B"), listOf(4, 4, 4, 4)),
+        Tuning("Baritone (DGBE)", listOf("D", "G", "B", "E"), listOf(3, 3, 3, 4)),
+        Tuning("Low G", listOf("G", "C", "E", "A"), listOf(3, 4, 4, 4)),
+        Tuning("Slack-Key (GCEG)", listOf("G", "C", "E", "G"), listOf(4, 4, 4, 4)),
+        Tuning("G-Major", listOf("D", "G", "B", "E"), listOf(3, 3, 3, 4)),
+        Tuning("Half-Step Up", listOf("G#", "C#", "F", "A#"), listOf(4, 4, 4, 4)),
+        Tuning("Full-Step Up", listOf("A", "D", "F#", "B"), listOf(4, 4, 4, 4)),
+        Tuning("Open C", listOf("G", "C", "E", "C"), listOf(4, 4, 4, 5)),
+        Tuning("Slide", listOf("A", "C#", "E", "A"), listOf(4, 4, 4, 4))
     )
 )
 
@@ -220,17 +206,29 @@ val colorblindRecommendedPalettes = listOf(
 class MainActivity : ComponentActivity() {
     private val audioAnalyzer = AudioAnalyzer()
     private lateinit var tunerSfx: TunerSfx
+    private val micGranted = MutableStateFlow(false)
     private val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
         // Si dan permiso de mic, partimos el analizador en segundo plano (IO)
-        if (isGranted) { CoroutineScope(Dispatchers.IO).launch { audioAnalyzer.start() } }
+        micGranted.value = isGranted
+        if (!isGranted) audioAnalyzer.tuningState.value = TuningData(message = "Activa el permiso de micrófono en los ajustes de Android para afinar.")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         tunerSfx = TunerSfx(this)
         checkAndRequestPermission()
+        val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        val rawAudio = audioManager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                micGranted.collectLatest { granted ->
+                    if (granted) audioAnalyzer.start(rawAudio)
+                }
+            }
+        }
         setContent {
             var settings by remember { mutableStateOf(AppSettings()) }
+            var settingsLoaded by remember { mutableStateOf(false) }
             var selectedInstrument by remember { mutableStateOf(Instrument.GUITAR) }
             var selectedTuning by remember { mutableStateOf(instrumentTunings[selectedInstrument]!!.first()) }
             var manualStringIndex by remember { mutableStateOf<Int?>(null) }
@@ -248,6 +246,7 @@ class MainActivity : ComponentActivity() {
                 MusicTheory.setReferenceA4(loaded.referenceA4Hz)
                 // Restaurar línea base de ruido ambiente si existe
                 AppPreferences.loadAmbient(ctx)?.let { audioAnalyzer.setAmbientBase(it) }
+                settingsLoaded = true
             }
 
             LaunchedEffect(settings.micSensitivity) {
@@ -263,8 +262,8 @@ class MainActivity : ComponentActivity() {
                 MusicTheory.setReferenceA4(settings.referenceA4Hz)
             }
             // Guardar ajustes cada vez que cambian
-            LaunchedEffect(settings) {
-                AppPreferences.saveSettings(applicationContext, settings)
+            LaunchedEffect(settings, settingsLoaded) {
+                if (settingsLoaded) AppPreferences.saveSettings(applicationContext, settings)
             }
 
             NASTunerTheme {
@@ -328,7 +327,7 @@ class MainActivity : ComponentActivity() {
 
     private fun checkAndRequestPermission() {
         when (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)) {
-            PackageManager.PERMISSION_GRANTED -> CoroutineScope(Dispatchers.IO).launch { audioAnalyzer.start() }
+            PackageManager.PERMISSION_GRANTED -> micGranted.value = true
             else -> requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
@@ -420,11 +419,6 @@ fun TunerScreen(
     var tuningMenuExpanded by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
 
-    // Auto-latch to a likely string in Auto mode
-    var autoLatchedIndex by remember(selectedInstrument, selectedTuning) { mutableStateOf<Int?>(null) }
-    var autoLatchScore by remember(selectedInstrument, selectedTuning) { mutableStateOf(0) }
-    val autoLatchThreshold = 4
-
     if (showSettingsDialog) {
         SettingsDialog(
             currentSettings = settings,
@@ -437,36 +431,23 @@ fun TunerScreen(
         )
     }
 
-    val (displayNote, deviation) = remember(tuningData, manualStringIndex, selectedTuning, settings.notationSystem) {
-        val targetNoteName = manualStringIndex?.let { selectedTuning.notes.getOrNull(it) }
-
-        val finalNote = targetNoteName ?: tuningData.note
-        val finalDeviation = if (targetNoteName != null && tuningData.frequency > 0) {
-            MusicTheory.calculateDeviationInHz(tuningData.frequency, targetNoteName)
-        } else {
-            tuningData.deviationInHz
-        }
+    val (displayNote, deviation) = remember(tuningData, manualStringIndex, selectedTuning, settings.notationSystem, settings.referenceA4Hz) {
+        val targetIndex = manualStringIndex?.takeIf { it in selectedTuning.notes.indices }
+            ?: selectedTuning.closestString(tuningData.frequency)
+        val finalNote = targetIndex?.let { selectedTuning.notes[it] } ?: tuningData.note
+        val finalDeviation = if (targetIndex != null && tuningData.frequency > 0) {
+            tuningData.frequency - selectedTuning.frequencies()[targetIndex]
+        } else 0.0
         
         val noteText = if (settings.notationSystem == NotationSystem.SOLFEGE) solfegeMap[finalNote] ?: finalNote else finalNote
         Pair(noteText, finalDeviation)
     }
 
-    val closestStringText = remember(tuningData.note, tuningData.frequency, selectedTuning) {
-        val notes = selectedTuning.notes
-        val detectedNote = tuningData.note
-        if (tuningData.frequency > 0 && notes.contains(detectedNote)) {
-            val indices = notes.indices.filter { notes[it] == detectedNote }
-            val chosenIndex = if (indices.size == 1) {
-                indices.first()
-            } else {
-                // Heuristic: for duplicated notes (e.g., E/E in guitar), pick high vs low by frequency
-                if ((tuningData.frequency) > 200.0) indices.last() else indices.first()
-            }
-            val stringNumber = notes.size - chosenIndex
-            "${stringNumber}ª Cuerda ($detectedNote)"
-        } else {
-            ""
-        }
+    val closestStringText = remember(tuningData, selectedTuning, settings.referenceA4Hz) {
+        if (tuningData.frequency > 0) {
+            val index = selectedTuning.closestString(tuningData.frequency)!!
+            "${selectedTuning.notes.size - index}ª Cuerda (${selectedTuning.notes[index]}${selectedTuning.octaves[index]})"
+        } else "Toca una cuerda a la vez"
     }
 
     Scaffold(
@@ -593,68 +574,10 @@ fun TunerScreen(
             setAnalyzerBounds(minHz, maxHz)
         }
     }
-    // Actualizar frecuencia esperada: manda manual; si no, auto‑latch mejorado cuando está estable
-    LaunchedEffect(manualStringIndex, selectedInstrument, selectedTuning, tuningData.frequency) {
-        val bounds = instrumentFrequencyRanges[selectedInstrument]
-        if (manualStringIndex != null && bounds != null) {
-            val noteName = selectedTuning.notes.getOrNull(manualStringIndex!!)
-            if (noteName != null) {
-                val expected = MusicTheory.nearestFrequencyForNoteInRange(noteName, bounds.first, bounds.second, preferAroundHz = null)
-                setExpectedFrequency(expected)
-            } else {
-                setExpectedFrequency(null)
-            }
-        } else {
-            // Auto‑latch: elige cuerda probable por cents + penaliza saltos de octava + premio continuidad
-            if (bounds != null && tuningData.frequency > 0) {
-                val fDet = tuningData.frequency
-                val baseFs = selectedTuning.notes.map { n -> MusicTheory.nearestFrequencyForNoteInRange(n, bounds.first, bounds.second) }
-                fun foldToNear(base: Double, f: Double): Double {
-                    var x = f
-                    while (x > base * 1.7) x /= 2.0
-                    while (x < base * 0.6) x *= 2.0
-                    return x
-                }
-                val candidates = baseFs.mapIndexed { idx, baseF ->
-                    val fNear = foldToNear(baseF, fDet)
-                    val cents = if (fNear > 0.0 && baseF > 0.0) 1200.0 * kotlin.math.log2(fNear / baseF) else 1e9
-                    val octaveJumps = kotlin.math.abs(kotlin.math.round(kotlin.math.log2(fDet / baseF))).toInt()
-                    val continuityBonus = if (autoLatchedIndex == idx) -10.0 else 0.0
-                    val score = kotlin.math.abs(cents) + (25.0 * octaveJumps) + continuityBonus
-                    idx to score
-                }
-                val (bestIdx, _) = candidates.minByOrNull { it.second } ?: (null to null)
-                if (bestIdx != null) {
-                    if (autoLatchedIndex == bestIdx) {
-                        autoLatchScore = (autoLatchScore + 1).coerceAtMost(autoLatchThreshold + 2)
-                    } else {
-                        autoLatchScore = (autoLatchScore - 1).coerceAtLeast(0)
-                    }
-                    if (autoLatchedIndex == null && autoLatchScore >= autoLatchThreshold) {
-                        autoLatchedIndex = bestIdx
-                    }
-                    // Al latchear, fijar expectedFreq de esa cuerda
-                    val activeIdx = autoLatchedIndex
-                    if (activeIdx != null) {
-                        val noteName = selectedTuning.notes[activeIdx]
-                        val expected = MusicTheory.nearestFrequencyForNoteInRange(noteName, bounds.first, bounds.second, preferAroundHz = null)
-                        setExpectedFrequency(expected)
-                    } else {
-                        setExpectedFrequency(null)
-                    }
-                }
-                // En silencio, reiniciar latch
-                if (tuningData.frequency <= 0) {
-                    autoLatchedIndex = null
-                    autoLatchScore = 0
-                }
-            } else {
-                setExpectedFrequency(null)
-                autoLatchedIndex = null
-                autoLatchScore = 0
-            }
-        }
+    LaunchedEffect(manualStringIndex, selectedInstrument, selectedTuning, settings.referenceA4Hz) {
+        setExpectedFrequency(manualStringIndex?.let { selectedTuning.frequencies().getOrNull(it) })
     }
+
 }
 
 @Composable
@@ -973,12 +896,8 @@ fun SoundSettingsTab(settings: AppSettings, onSettingsChange: (AppSettings) -> U
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { onSettingsChange(settings.copy(precisionMode = mode)) }) {
                 RadioButton(selected = settings.precisionMode == mode, onClick = null)
                 Spacer(Modifier.width(8.dp))
-                Text(text = "${mode.displayName} (±${mode.threshold} Hz)")
+                Text(text = mode.displayName)
             }
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(checked = settings.adaptiveThreshold, onCheckedChange = { onSettingsChange(settings.copy(adaptiveThreshold = it)) })
-            Text("Tolerancia Adaptativa")
         }
         Spacer(modifier = Modifier.height(16.dp))
         Text("Referencia A4", style = MaterialTheme.typography.titleMedium)
@@ -1002,7 +921,7 @@ fun SoundSettingsTab(settings: AppSettings, onSettingsChange: (AppSettings) -> U
                 }
             }) { Text("Calibrar ambiente") }
             Button(onClick = {
-                calibMessage = "Autocalibrando A4... Toca un La (A) y mantenlo"
+                calibMessage = "Escuchando un La de referencia externa. No uses una cuerda sin afinar."
                 scope.launch {
                     val a4 = calibrateA4(2000)
                     if (a4 != null) {
@@ -1061,7 +980,7 @@ fun VisualSettingsTab(settings: AppSettings, onSettingsChange: (AppSettings) -> 
                 // Map current cents selection to equivalent Hz by index (fallback to recommended index 1)
                 val hzOptions = listOf(
                     VisualRange(1.0, 2.0),
-                    VisualRange(2.0, 4.0),
+                    VisualRange(10.0, 20.0),
                     VisualRange(3.0, 5.0),
                     VisualRange(5.0, 10.0)
                 )
@@ -1084,7 +1003,7 @@ fun VisualSettingsTab(settings: AppSettings, onSettingsChange: (AppSettings) -> 
                 // Map current Hz selection to equivalent cents by index (fallback to recommended index 1)
                 val hzOptions = listOf(
                     VisualRange(1.0, 2.0),
-                    VisualRange(2.0, 4.0),
+                    VisualRange(10.0, 20.0),
                     VisualRange(3.0, 5.0),
                     VisualRange(5.0, 10.0)
                 )
@@ -1130,11 +1049,11 @@ fun VisualSettingsTab(settings: AppSettings, onSettingsChange: (AppSettings) -> 
 
         Spacer(Modifier.height(8.dp))
         // Latch duration selector
-        Text("Estabilidad de nota", style = MaterialTheme.typography.titleMedium)
+        Text("Tiempo para confirmar la nota", style = MaterialTheme.typography.titleMedium)
         val latchOptions = listOf(
-            500L to "0.5 s",
-            1000L to "1 s",
-            2000L to "2 s (Recomendado)"
+            0L to "Inmediata",
+            120L to "120 ms (Recomendado)",
+            250L to "250 ms"
         )
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             latchOptions.forEach { (ms, label) ->
@@ -1153,21 +1072,14 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     val indicatorColor = accentColor.copy(alpha = 0.95f)
     val indicatorHeight = 250.dp
 
-    // Dos niveles de umbral: visual (más permisivo) vs estricto (práctico)
-    val baseThreshold = if (settings.adaptiveThreshold) {
-        when {
-            tuningData.frequency < 80 -> 2.5
-            tuningData.frequency in 80.0..500.0 -> 1.5
-            else -> 1.0
-        }
-    } else {
-        settings.precisionMode.threshold
-    }
-    val strictThresholdHz = baseThreshold * 0.75 // stricter practical pass
-    val visualThresholdHz = baseThreshold * 1.6 // more permissive for UI feel
-
-    val isInTuneVisual = abs(deviationInHz) < visualThresholdHz
-    val isInTuneStrict = abs(deviationInHz) < strictThresholdHz
+    val hasSignal = tuningData.frequency > 0 && tuningData.confidence >= 0.88
+    val targetFrequency = tuningData.frequency - deviationInHz
+    val deviationCents = if (hasSignal && targetFrequency > 0) 1200 * log2(tuningData.frequency / targetFrequency) else 0.0
+    val thresholdCents = settings.precisionMode.threshold
+    var wasInTune by remember { mutableStateOf(false) }
+    val isInTuneVisual = hasSignal && !tuningData.isHeld && abs(deviationCents) <= thresholdCents + if (wasInTune) 1.0 else 0.0
+    LaunchedEffect(isInTuneVisual) { wasInTune = isInTuneVisual }
+    val isInTuneStrict = isInTuneVisual
     var prevStrict by remember { mutableStateOf(false) }
     LaunchedEffect(isInTuneStrict) {
         if (!prevStrict && isInTuneStrict) {
@@ -1195,6 +1107,17 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     )
     val animatedStrokeWidth by animateFloatAsState(targetValue = if (isInTuneVisual) 8f else 5f, label = "strokeAnimation")
 
+    Text(
+        text = when {
+            !hasSignal -> tuningData.message ?: "Esperando una cuerda…"
+            tuningData.isHeld -> "Última lectura · buscando señal…"
+            isInTuneStrict -> "Afinado · ${"%.1f".format(tuningData.frequency)} Hz"
+            else -> "${"%+.1f".format(deviationCents)} cents · ${"%.1f".format(tuningData.frequency)} Hz"
+        },
+        color = accentColor,
+        fontSize = 18.sp
+    )
+
     // Selección de unidad de desviación (Hz o cents)
     val unitIsHz = settings.guideUnit == GuideUnit.HZ
     val minor = settings.visualRange.minor
@@ -1203,26 +1126,11 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     val deviationUnits = if (unitIsHz) deviationInHz else {
         if (tuningData.frequency > 0 && targetHz > 0.0) 1200.0 * log2(tuningData.frequency / targetHz) else 0.0
     }
-    // Suavizado visual y zona muerta para reducir jitter (más conservador)
-    val deadbandUnits = if (unitIsHz) 0.2 else 4.0
-    var visualUnits by remember { mutableStateOf(0.0) }
-    LaunchedEffect(deviationUnits) {
-        val alpha = 0.15
-        visualUnits = visualUnits + alpha * (deviationUnits - visualUnits)
-    }
-    val displayUnits = if (kotlin.math.abs(visualUnits) < deadbandUnits) 0.0 else visualUnits
-    val normalizedOffset = (displayUnits / major).coerceIn(-1.0, 1.0).toFloat()
-    // Límite adicional de velocidad para acotar el movimiento por cuadro
-    var smoothedOffset by remember { mutableStateOf(0f) }
-    LaunchedEffect(normalizedOffset) {
-        // Slightly higher damping at low confidence (more smoothing), more agile when confident
-        val maxStep = 0.04f + 0.06f * baseConfidence
-        val delta = (normalizedOffset - smoothedOffset).coerceIn(-maxStep, maxStep)
-        smoothedOffset += delta
-    }
+    val normalizedOffset = (deviationUnits / major.coerceAtLeast(0.1)).coerceIn(-1.0, 1.0).toFloat()
+    val displayUnits = deviationUnits
     val animatedOffset by animateFloatAsState(
-        targetValue = smoothedOffset,
-        animationSpec = spring(dampingRatio = 1.2f, stiffness = Spring.StiffnessVeryLow),
+        targetValue = normalizedOffset,
+        animationSpec = spring(dampingRatio = 1f, stiffness = Spring.StiffnessMedium),
         label = "offsetAnimation"
     )
 
@@ -1287,14 +1195,14 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
             }
 
             // Halo y círculo
-            if (animatedGlow > 0) {
+            if (hasSignal && animatedGlow > 0) {
                 drawCircle(
                     brush = Brush.radialGradient(colors = listOf(accentColor.copy(alpha = 0.55f * animatedGlow), Color.Transparent), center = circleCenter, radius = animatedRadius * 3.2f * animatedGlow),
                     radius = animatedRadius * 3.0f * animatedGlow,
                     center = circleCenter
                 )
             }
-            drawCircle(color = accentColor, radius = animatedRadius, center = circleCenter)
+            if (hasSignal) drawCircle(color = accentColor, radius = animatedRadius, center = circleCenter)
         }
 
         // Dibujar etiquetas como composables alineadas a la izquierda
@@ -1317,7 +1225,7 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
         displayUnits < -0.25 * minor -> "Bajo"
         else -> null
     }
-    if (hintText != null) {
+    if (hasSignal && hintText != null) {
         val arrow = if (hintText == "Alto") "⬆" else "⬇"
         Text(
             text = "$arrow $hintText",
@@ -1328,62 +1236,3 @@ fun TuningIndicator(deviationInHz: Double, accentColor: Color, backgroundColor: 
     }
 }
 
-object MusicTheory {
-    private var REF_A4 = 440.0
-    val NOTES = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
-    fun setReferenceA4(hz: Double) { if (hz.isFinite() && hz in 350.0..500.0) REF_A4 = hz }
-    fun getReferenceA4(): Double = REF_A4
-    fun estimateOctave(frequency: Double): Int {
-        if (frequency <= 0.0) return 4
-        val nEst = (A4_INDEX + 12 * log2(frequency / REF_A4)).roundToInt()
-        return floor(nEst / 12.0).toInt()
-    }
-    
-    fun frequencyToNote(frequency: Double): TuningData {
-        if (frequency <= 0.0) return TuningData(frequency = frequency)
-        val noteNumber = 12 * log2(frequency / REF_A4)
-        val roundedNoteIndex = (A4_INDEX + noteNumber).roundToInt()
-        val noteIndex = (roundedNoteIndex % 12).let { if (it < 0) it + 12 else it }
-        val note = NOTES[noteIndex]
-        val idealFrequency = REF_A4 * 2.0.pow((roundedNoteIndex - A4_INDEX) / 12.0)
-        val deviationInHz = frequency - idealFrequency
-        
-        return TuningData(note, deviationInHz, frequency)
-    }
-
-    fun calculateDeviationInHz(frequency: Double, targetNoteName: String): Double {
-        val targetNoteIndex = NOTES.indexOf(targetNoteName)
-        if(targetNoteIndex == -1) return 0.0
-
-        // Find nearest octave of the target note around the detected frequency
-        val nEst = (A4_INDEX + 12 * log2(frequency / REF_A4)).roundToInt()
-        val kBase = floor((nEst - targetNoteIndex) / 12.0).toInt()
-        val candidates = listOf(
-            targetNoteIndex + 12 * kBase,
-            targetNoteIndex + 12 * (kBase + 1)
-        )
-        val targetIdealIndex = candidates.minByOrNull { idx ->
-            val f = REF_A4 * 2.0.pow((idx - A4_INDEX) / 12.0)
-            kotlin.math.abs(f - frequency)
-        } ?: (targetNoteIndex + 12 * kBase)
-        val targetIdealFrequency = REF_A4 * 2.0.pow((targetIdealIndex - A4_INDEX) / 12.0)
-
-        return frequency - targetIdealFrequency
-    }
-
-    // Find nearest frequency for a note name within a range, optionally biased around a preferred frequency
-    fun nearestFrequencyForNoteInRange(noteName: String, minHz: Double, maxHz: Double, preferAroundHz: Double? = null): Double {
-        val idx = NOTES.indexOf(noteName)
-        if (idx == -1) return 0.0
-        val candidates = mutableListOf<Double>()
-        // Scan octaves around A4 index
-        for (k in -36..36) { // enough range
-            val noteIndex = A4_INDEX + (idx - NOTES.indexOf("A")) + k
-            val f = REF_A4 * 2.0.pow((noteIndex - A4_INDEX) / 12.0)
-            if (f in minHz..maxHz) candidates.add(f)
-        }
-        if (candidates.isEmpty()) return 0.0
-        val target = preferAroundHz ?: ((minHz + maxHz) / 2.0)
-        return candidates.minByOrNull { kotlin.math.abs(it - target) } ?: candidates.first()
-    }
-}
